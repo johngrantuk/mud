@@ -3,6 +3,8 @@ import path from "path";
 import chalk from "chalk";
 import { BigNumber, ContractInterface, ethers } from "ethers";
 import { defaultAbiCoder as abi, Fragment, ParamType } from "ethers/lib/utils.js";
+import { createPublicClient, createWalletClient, http, Hex, Abi, Address } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 
 import { getOutDirectory, getScriptDirectory, cast, forge } from "@latticexyz/common/foundry";
 import { resolveWithContext } from "@latticexyz/config";
@@ -19,6 +21,22 @@ import KeysWithValueModuleData from "@latticexyz/world/abi/KeysWithValueModule.s
 import KeysInTableModuleData from "@latticexyz/world/abi/KeysInTableModule.sol/KeysInTableModule.json" assert { type: "json" };
 import UniqueEntityModuleData from "@latticexyz/world/abi/UniqueEntityModule.sol/UniqueEntityModule.json" assert { type: "json" };
 import SnapSyncModuleData from "@latticexyz/world/abi/SnapSyncModule.sol/SnapSyncModule.json" assert { type: "json" };
+import { getChain } from "./getChainId";
+import { stringToBytes16 } from "@latticexyz/utils";
+
+export function uint8ArrayToHex(array: Uint8Array): string {
+  let hex = "";
+  for (let i = 0; i < array.length; i++) {
+    const byte = array[i];
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+function convertToBytes16(uint8Array: Uint8Array): string {
+  const hexString = Array.from(uint8Array, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return hexString.padEnd(32, "0");
+}
 
 export interface DeployConfig {
   profile?: string;
@@ -50,17 +68,34 @@ export async function deploy(
   const forgeOutDirectory = await getOutDirectory(profile);
 
   // Set up signer for deployment
-  const provider = new ethers.providers.StaticJsonRpcProvider(rpc);
-  provider.pollingInterval = pollInterval;
-  const signer = new ethers.Wallet(privateKey, provider);
+  // const provider = new ethers.providers.StaticJsonRpcProvider(rpc);
+  // provider.pollingInterval = pollInterval;
+  // const signer = new ethers.Wallet(privateKey, provider);
+
+  // Set up Local Account for deployment
+  const publicClient = createPublicClient({
+    transport: http(rpc),
+    pollingInterval: pollInterval,
+  });
+  const chainId = await publicClient.getChainId();
+  const chain = getChain(chainId);
+  const account = privateKeyToAccount(privateKey as Hex);
+  const client = createWalletClient({
+    chain,
+    account,
+    pollingInterval: pollInterval,
+    transport: http(rpc),
+  });
 
   // Manual nonce handling to allow for faster sending of transactions without waiting for previous transactions
-  let nonce = await signer.getTransactionCount();
+  let nonce = await publicClient.getTransactionCount({
+    address: account.address,
+  });
   console.log("Initial nonce", nonce);
 
   // Compute maxFeePerGas and maxPriorityFeePerGas like ethers, but allow for a multiplier to allow replacing pending transactions
   let maxPriorityFeePerGas: number;
-  let maxFeePerGas: BigNumber;
+  let maxFeePerGas: bigint;
   await setInternalFeePerGas(priorityFeeMultiplier);
 
   // Catch all to await any promises before exiting the script
@@ -129,20 +164,36 @@ export async function deploy(
   // Combine all contracts into one object
   const contractPromises: Record<string, Promise<string>> = { ...worldPromise, ...systemPromises, ...modulePromises };
 
+  const worldContractAddr = await contractPromises.World;
   // Create World contract instance from deployed address
-  const WorldContract = new ethers.Contract(await contractPromises.World, IBaseWorldData.abi, signer) as IBaseWorld;
+  // const WorldContract = new ethers.Contract(worldContractAddr, IBaseWorldData.abi, signer) as IBaseWorld;
 
   const confirmations = disableTxWait ? 0 : 1;
 
   // Install core Modules
   if (!worldAddress) {
     console.log(chalk.blue("Installing core World modules"));
-    await fastTxExecute(WorldContract, "installRootModule", [await modulePromises.CoreModule, "0x"], confirmations);
+    // await fastTxExecute(WorldContract, "installRootModule", [await modulePromises.CoreModule, "0x"], confirmations);
+    await fastTx(
+      worldContractAddr as Hex,
+      IBaseWorldData.abi as Abi,
+      "installRootModule",
+      [await modulePromises.CoreModule, "0x"],
+      confirmations
+    );
     console.log(chalk.green("Installed core World modules"));
   }
 
   // Register namespace
-  if (namespace) await fastTxExecute(WorldContract, "registerNamespace", [toBytes16(namespace)], confirmations);
+  // if (namespace) await fastTxExecute(WorldContract, "registerNamespace", [toBytes16(namespace)], confirmations);
+  if (namespace)
+    await fastTx(
+      worldContractAddr as Hex,
+      IBaseWorldData.abi as Abi,
+      "registerNamespace",
+      [toBytes16(namespace)],
+      confirmations
+    );
 
   // Register tables
   const tableIds: { [tableName: string]: Uint8Array } = {};
@@ -165,16 +216,34 @@ export async function deploy(
         return schemaType;
       });
 
-      await fastTxExecute(
-        WorldContract,
+      // await fastTxExecute(
+      //   WorldContract,
+      //   "registerTable",
+      //   [toBytes16(namespace), toBytes16(name), encodeSchema(schemaTypes), encodeSchema(keyTypes)],
+      //   confirmations
+      // );
+      const x = uint8ArrayToHex(encodeSchema(schemaTypes));
+      const y = uint8ArrayToHex(encodeSchema(keyTypes));
+      const a = convertToBytes16(stringToBytes16(namespace));
+      const b = convertToBytes16(stringToBytes16(name));
+      await fastTx(
+        worldContractAddr as Hex,
+        IBaseWorldData.abi as Abi,
         "registerTable",
-        [toBytes16(namespace), toBytes16(name), encodeSchema(schemaTypes), encodeSchema(keyTypes)],
+        [`0x${a}`, `0x${b}`, `0x${x}`, `0x${y}`],
         confirmations
       );
 
       // Register table metadata
-      await fastTxExecute(
-        WorldContract,
+      // await fastTxExecute(
+      //   WorldContract,
+      //   "setMetadata(bytes16,bytes16,string,string[])",
+      //   [toBytes16(namespace), toBytes16(name), tableName, Object.keys(schema)],
+      //   confirmations
+      // );
+      await fastTx(
+        worldContractAddr as Hex,
+        IBaseWorldData.abi as Abi,
         "setMetadata(bytes16,bytes16,string,string[])",
         [toBytes16(namespace), toBytes16(name), tableName, Object.keys(schema)],
         confirmations
@@ -191,10 +260,19 @@ export async function deploy(
       async ([systemName, { name, openAccess, registerFunctionSelectors }]) => {
         // Register system at route
         console.log(chalk.blue(`Registering system ${systemName} at ${namespace}/${name}`));
-        await fastTxExecute(
-          WorldContract,
+        // await fastTxExecute(
+        //   WorldContract,
+        //   "registerSystem",
+        //   [toBytes16(namespace), toBytes16(name), await contractPromises[systemName], openAccess],
+        //   confirmations
+        // );
+        const a = convertToBytes16(stringToBytes16(namespace));
+        const b = convertToBytes16(stringToBytes16(name));
+        await fastTx(
+          worldContractAddr as Hex,
+          IBaseWorldData.abi as Abi,
           "registerSystem",
-          [toBytes16(namespace), toBytes16(name), await contractPromises[systemName], openAccess],
+          [`0x${a}`, `0x${b}`, await contractPromises[systemName], openAccess],
           confirmations
         );
         console.log(chalk.green(`Registered system ${systemName} at ${namespace}/${name}`));
@@ -218,15 +296,29 @@ export async function deploy(
                     : { functionName, functionArgs }
                 );
                 const systemFunctionSelector = toFunctionSelector({ functionName, functionArgs });
-                await fastTxExecute(
-                  WorldContract,
+                // await fastTxExecute(
+                //   WorldContract,
+                //   "registerRootFunctionSelector",
+                //   [toBytes16(namespace), toBytes16(name), worldFunctionSelector, systemFunctionSelector],
+                //   confirmations
+                // );
+                await fastTx(
+                  worldContractAddr as Hex,
+                  IBaseWorldData.abi as Abi,
                   "registerRootFunctionSelector",
                   [toBytes16(namespace), toBytes16(name), worldFunctionSelector, systemFunctionSelector],
                   confirmations
                 );
               } else {
-                await fastTxExecute(
-                  WorldContract,
+                // await fastTxExecute(
+                //   WorldContract,
+                //   "registerFunctionSelector",
+                //   [toBytes16(namespace), toBytes16(name), functionName, functionArgs],
+                //   confirmations
+                // );
+                await fastTx(
+                  worldContractAddr as Hex,
+                  IBaseWorldData.abi as Abi,
                   "registerFunctionSelector",
                   [toBytes16(namespace), toBytes16(name), functionName, functionArgs],
                   confirmations
@@ -253,8 +345,15 @@ export async function deploy(
       ...promises,
       ...accessListAddresses.map(async (address) => {
         console.log(chalk.blue(`Grant ${address} access to ${systemName} (${resourceSelector})`));
-        await fastTxExecute(
-          WorldContract,
+        // await fastTxExecute(
+        //   WorldContract,
+        //   "grantAccess",
+        //   [toBytes16(namespace), toBytes16(name), address],
+        //   confirmations
+        // );
+        await fastTx(
+          worldContractAddr as Hex,
+          IBaseWorldData.abi as Abi,
           "grantAccess",
           [toBytes16(namespace), toBytes16(name), address],
           confirmations
@@ -268,8 +367,15 @@ export async function deploy(
       ...promises,
       ...accessListSystems.map(async (granteeSystem) => {
         console.log(chalk.blue(`Grant ${granteeSystem} access to ${systemName} (${resourceSelector})`));
-        await fastTxExecute(
-          WorldContract,
+        // await fastTxExecute(
+        //   WorldContract,
+        //   "grantAccess",
+        //   [toBytes16(namespace), toBytes16(name), await contractPromises[granteeSystem]],
+        //   confirmations
+        // );
+        await fastTx(
+          worldContractAddr as Hex,
+          IBaseWorldData.abi as Abi,
           "grantAccess",
           [toBytes16(namespace), toBytes16(name), await contractPromises[granteeSystem]],
           confirmations
@@ -298,8 +404,15 @@ export async function deploy(
       if (!moduleAddress) throw new Error(`Module ${module.name} not found`);
 
       // Send transaction to install module
-      await fastTxExecute(
-        WorldContract,
+      // await fastTxExecute(
+      //   WorldContract,
+      //   module.root ? "installRootModule" : "installModule",
+      //   [moduleAddress, abi.encode(types, values)],
+      //   confirmations
+      // );
+      await fastTx(
+        worldContractAddr as Hex,
+        IBaseWorldData.abi as Abi,
         module.root ? "installRootModule" : "installModule",
         [moduleAddress, abi.encode(types, values)],
         confirmations
@@ -313,7 +426,9 @@ export async function deploy(
   await Promise.all(promises); // ----------------------------------------------------------------------------------------------
 
   // Confirm the current nonce is the expected nonce to make sure all transactions have been included
-  let remoteNonce = await signer.getTransactionCount();
+  let remoteNonce = await publicClient.getTransactionCount({
+    address: account.address,
+  });
   let retryCount = 0;
   const maxRetries = 100;
   while (remoteNonce !== nonce && retryCount < maxRetries) {
@@ -324,7 +439,9 @@ export async function deploy(
     );
     await new Promise((resolve) => setTimeout(resolve, pollInterval));
     retryCount++;
-    remoteNonce = await signer.getTransactionCount();
+    remoteNonce = await publicClient.getTransactionCount({
+      address: account.address,
+    });
   }
   if (remoteNonce !== nonce) {
     throw new MUDError(
@@ -387,6 +504,46 @@ export async function deploy(
    * @param retryCount
    * @returns Address of the deployed contract
    */
+  // async function deployContractOG(
+  //   abi: ContractInterface,
+  //   bytecode: string | { object: string },
+  //   disableTxWait: boolean,
+  //   contractName?: string,
+  //   retryCount = 0
+  // ): Promise<string> {
+  //   try {
+  //     const factory = new ethers.ContractFactory(abi, bytecode, signer);
+  //     console.log(chalk.gray(`executing deployment of ${contractName} with nonce ${nonce}`));
+  //     const deployPromise = factory
+  //       .deploy({
+  //         nonce: nonce++,
+  //         maxPriorityFeePerGas,
+  //         maxFeePerGas,
+  //       })
+  //       .then((c) => (disableTxWait ? c : c.deployed()));
+
+  //     promises.push(deployPromise);
+  //     const { address } = await deployPromise;
+
+  //     console.log(chalk.green("Deployed", contractName, "to", address));
+  //     return address;
+  //   } catch (error: any) {
+  //     if (debug) console.error(error);
+  //     if (retryCount === 0 && error?.message.includes("transaction already imported")) {
+  //       // If the deployment failed because the transaction was already imported,
+  //       // retry with a higher priority fee
+  //       setInternalFeePerGas(priorityFeeMultiplier * 1.1);
+  //       return deployContract(abi, bytecode, disableTxWait, contractName, retryCount++);
+  //     } else if (error?.message.includes("invalid bytecode")) {
+  //       throw new MUDError(
+  //         `Error deploying ${contractName}: invalid bytecode. Note that linking of public libraries is not supported yet, make sure none of your libraries use "external" functions.`
+  //       );
+  //     } else if (error?.message.includes("CreateContractLimit")) {
+  //       throw new MUDError(`Error deploying ${contractName}: CreateContractLimit exceeded.`);
+  //     } else throw error;
+  //   }
+  // }
+
   async function deployContract(
     abi: ContractInterface,
     bytecode: string | { object: string },
@@ -395,21 +552,23 @@ export async function deploy(
     retryCount = 0
   ): Promise<string> {
     try {
-      const factory = new ethers.ContractFactory(abi, bytecode, signer);
       console.log(chalk.gray(`executing deployment of ${contractName} with nonce ${nonce}`));
-      const deployPromise = factory
-        .deploy({
-          nonce: nonce++,
-          maxPriorityFeePerGas,
-          maxFeePerGas,
-        })
-        .then((c) => (disableTxWait ? c : c.deployed()));
 
-      promises.push(deployPromise);
-      const { address } = await deployPromise;
+      const hash = await client.deployContract({
+        abi: abi as Abi,
+        bytecode: typeof bytecode === "string" ? (bytecode as Hex) : (bytecode.object as Hex),
+        nonce: nonce++,
+        gas: 30000000n, // TODO - viem throws without this with EstimateGasExecutionError: The amount of gas provided for the transaction exceeds the limit allowed for the block.
+      });
+      if (!hash) throw Error("No Deploy"); // TODO - How was this handled?
 
-      console.log(chalk.green("Deployed", contractName, "to", address));
-      return address;
+      // TODO Was this doing anything??
+      console.log(`!!!!!! disableTxWait`, disableTxWait);
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      const contractAddress = receipt.contractAddress;
+      // promises.push(deployPromise);
+      console.log(chalk.green("Deployed", contractName, "to", contractAddress));
+      return contractAddress as string;
     } catch (error: any) {
       if (debug) console.error(error);
       if (retryCount === 0 && error?.message.includes("transaction already imported")) {
@@ -496,6 +655,9 @@ export async function deploy(
     try {
       const gasLimit = await contract.estimateGas[func].apply(null, args);
       console.log(chalk.gray(`executing transaction: ${functionName} with nonce ${nonce}`));
+      console.log(maxFeePerGas);
+      console.log(maxPriorityFeePerGas);
+      console.log(gasLimit.toString());
       const txPromise = contract[func]
         .apply(null, [...args, { gasLimit, nonce: nonce++, maxPriorityFeePerGas, maxFeePerGas }])
         .then((tx: any) => (confirmations === 0 ? tx : tx.wait(confirmations)));
@@ -509,6 +671,58 @@ export async function deploy(
         setInternalFeePerGas(priorityFeeMultiplier * 1.1);
         return fastTxExecute(contract, func, args, confirmations, retryCount++);
       } else throw new MUDError(`Gas estimation error for ${functionName}: ${error?.reason}`);
+    }
+  }
+
+  async function fastTx(
+    address: Address,
+    abi: Abi,
+    func: string,
+    args: any,
+    confirmations = 1,
+    retryCount = 0
+  ): Promise<void> {
+    const functionDisplay = `JOHNS ${func as string}(${args.map((arg: any) => `'${arg}'`).join(",")})`;
+    console.log(functionDisplay);
+    console.log(address);
+    try {
+      // // https://github.com/wagmi-dev/viem/discussions/239
+      // const gasLimit = await contract.estimateGas[func].apply(null, args);
+      // const gl = await publicClient.estimateGas.apply(null, args);
+      console.log(chalk.gray(`executing transaction: ${functionDisplay} with nonce ${nonce}`));
+      const result = await publicClient.simulateContract({
+        address,
+        abi,
+        functionName: func,
+        account,
+        maxPriorityFeePerGas: BigInt(maxPriorityFeePerGas),
+        maxFeePerGas,
+        nonce: nonce++,
+        args: [...args],
+      });
+      // console.log(result);
+      console.log(`???????????? 1 hello ${functionDisplay}`);
+      const hash = await client.writeContract(result.request);
+      console.log("???????????? 2");
+      promises.push(publicClient.waitForTransactionReceipt({ hash, confirmations }));
+
+      // if (confirmations === 0) promises.push(client.writeContract(result.request));
+      // else {
+      //   console.log("???????????? 1");
+      //   const hash = await client.writeContract(result.request);
+      //   console.log("???????????? 2");
+      //   promises.push(publicClient.waitForTransactionReceipt({ hash, confirmations }));
+      // }
+    } catch (error: any) {
+      console.log(`!!!!!!! EEEK ${functionDisplay} ${nonce}`);
+      console.log(error);
+      if (debug) console.error(error);
+      if (retryCount === 0 && error?.message.includes("transaction already imported")) {
+        // If the deployment failed because the transaction was already imported,
+        // retry with a higher priority fee
+        setInternalFeePerGas(priorityFeeMultiplier * 1.1);
+        return fastTx(address, abi, func, args, confirmations, retryCount++);
+      } else throw new MUDError(`Gas estimation error for ${functionDisplay}: ${error?.reason}`);
     }
   }
 
@@ -541,16 +755,21 @@ export async function deploy(
    */
   async function setInternalFeePerGas(multiplier: number) {
     // Compute maxFeePerGas and maxPriorityFeePerGas like ethers, but allow for a multiplier to allow replacing pending transactions
-    const feeData = await provider.getFeeData();
-    if (!feeData.lastBaseFeePerGas) throw new MUDError("Can not fetch lastBaseFeePerGas from RPC");
-    if (!feeData.lastBaseFeePerGas.eq(0) && (await signer.getBalance()).eq(0)) {
+    const gasEstimate = await publicClient.getFeeHistory({
+      blockCount: 4, // TODO - These values are taken directly from Viem and could be improved?
+      rewardPercentiles: [25, 75],
+    });
+    const balance = await publicClient.getBalance({
+      address: account.address,
+    });
+    if (!(gasEstimate.baseFeePerGas[0] === 0n) && balance === 0n) {
       throw new MUDError(`Attempting to deploy to a chain with non-zero base fee with an account that has no balance.
-If you're deploying to the Lattice testnet, you can fund your account by running 'pnpm mud faucet --address ${await signer.getAddress()}'`);
+If you're deploying to the Lattice testnet, you can fund your account by running 'pnpm mud faucet --address ${account.address}'`);
     }
 
     // Set the priority fee to 0 for development chains with no base fee, to allow transactions from unfunded wallets
-    maxPriorityFeePerGas = feeData.lastBaseFeePerGas.eq(0) ? 0 : Math.floor(1_500_000_000 * multiplier);
-    maxFeePerGas = feeData.lastBaseFeePerGas.mul(2).add(maxPriorityFeePerGas);
+    maxPriorityFeePerGas = gasEstimate.baseFeePerGas[0] === 0n ? 0 : Math.floor(1_500_000_000 * multiplier);
+    maxFeePerGas = gasEstimate.baseFeePerGas[0] * 2n + BigInt(maxPriorityFeePerGas);
   }
 }
 
